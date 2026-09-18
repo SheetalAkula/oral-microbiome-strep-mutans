@@ -1,0 +1,609 @@
+---
+title: "Metabolomics Analysis: *S. mutans* UA159, lrgAB, and atlA Mutants Under Aerobic/Anaerobic Growth"
+subtitle: "Ahn et al. study — amino acids, acylcarnitines, organic acids, NAD/adenylate/CoA pools"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    fig_width: 8
+    fig_height: 5.5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                       fig.align = "center")
+```
+
+# 1. Overview
+
+This report parses the two source workbooks describing the study and its
+results:
+
+* **`Ahn_study.xls`** — Metabolomics Workbench-style study design (`Study Design` sheet):
+  which strain, sample type, growth medium, and growth condition each numbered
+  sample corresponds to.
+* **`Ahn_Results.xlsx`** — one "Results" sheet per metabolite class (amino
+  acids, acylcarnitines, organic acids, NAD-related metabolites, adenylates
+  ATP/ADP/AMP, and acyl-CoAs), each giving metabolite abundance across the
+  numbered samples, plus a matching "Additional Info" sheet with annotation
+  (retention index, PubChem/KEGG IDs).
+
+The study compares three *Streptococcus mutans* strains — **UA159 (wild
+type)**, **lrgAB mutant**, and **atlA mutant** — grown **aerobically** or
+**anaerobically**, profiling both **whole cells** and, for UA159/lrgAB only,
+the **culture supernatant ("Media")**. Three biological replicates were
+collected per condition.
+
+Two design quirks in the source data drive how the analysis below is
+organized, and both are read directly from which sample columns exist in
+each `Results` sheet rather than assumed:
+
+1. **Not every strain has every panel.** Amino acids, organic acids, NAD
+   metabolites, and adenylates (ATP/ADP/AMP) were only run on UA159 and
+   lrgAB — the atlA mutant simply has no columns in those sheets. Acylcarnitines
+   are the *only* panel that includes all three strains. This is why plots
+   below sometimes legitimately show two strains and sometimes three — Section
+   5.1 makes the exact coverage explicit so it's never a silent omission.
+2. **Whole cells and supernatant are different matrices, not the same pool
+   in two forms** — cell pellets are reported in `nmol / mg protein`, media
+   in `uM`, over different (and only partly overlapping) strain/sample sets. They
+   are never pooled into one "value" for statistics or PCA; every comparison
+   below keeps `Matrix` (Cells vs. Media) as an explicit grouping variable,
+   and Sections 6.3 and 8 place the two side by side, panel-for-panel, per
+   metabolite so intracellular pool and secretion can be read together
+   without conflating their scales.
+
+Values flagged `BLOQ` (below limit of quantitation), `N.D.` (not detected),
+or `N/A` (unsuitable sample) are treated as censored/missing rather than
+zero, which is standard practice for targeted metabolomics panels.
+
+```{r libraries}
+library(readxl)   # read .xls / .xlsx
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(purrr)
+library(forcats)
+library(ggplot2)
+library(scales)
+
+theme_set(theme_bw(base_size = 12))
+```
+
+# 2. File paths
+
+Edit these two lines to point at your local copies of the workbooks (they
+can be `.xls`/`.xlsx` interchangeably — `readxl` handles both).
+
+```{r paths}
+study_path   <- "Ahn_study.xls"
+results_path <- "Ahn_Results.xlsx"
+```
+
+# 3. Import sample metadata (Study Design)
+
+```{r sample-metadata}
+clean_id <- function(x) {
+  x <- trimws(as.character(x))
+  sub("\\.0$", "", x)   # readxl sometimes round-trips whole numbers as "7.0"
+}
+
+sd_raw <- read_excel(study_path, sheet = "Study Design", skip = 2, col_names = FALSE)
+
+sample_meta <- sd_raw %>%
+  transmute(
+    Sample_ID        = clean_id(...3),
+    Strain           = as.character(...4),
+    Sample_Type      = as.character(...5),
+    Growth_Media     = as.character(...6),
+    Growth_Condition = as.character(...7)
+  ) %>%
+  filter(!is.na(Sample_ID), Sample_ID != "") %>%
+  mutate(
+    # media-only blanks (C1-1..C1-3) carry "N/A" instead of a real strain/condition
+    Strain           = ifelse(Sample_Type == "Media only", "Media blank", Strain),
+    Growth_Condition = ifelse(Sample_Type == "Media only", "n/a", Growth_Condition),
+    Replicate = {
+      num_id <- suppressWarnings(as.numeric(Sample_ID))
+      case_when(
+        str_detect(Sample_ID, "^C1-") ~ str_extract(Sample_ID, "[0-9]+$"),
+        num_id <= 10 ~ "1",
+        num_id <= 20 ~ "2",
+        TRUE          ~ "3"
+      )
+    },
+    Strain = factor(Strain, levels = c("UA159 wild type", "lrgAB mutant",
+                                        "atlA mutant", "Media blank")),
+    Growth_Condition = factor(Growth_Condition,
+                               levels = c("anaerobically", "aerobically", "n/a"))
+  )
+
+knitr::kable(sample_meta, caption = "Sample -> strain / condition mapping")
+```
+
+# 4. Generic reader for the "Results" sheets
+
+Every `Results *` sheet has the same shape once you find the header row (the
+row starting with "Metabolite name"): an id block (`Metabolite name`,
+optionally `InChI Key`, `Units of Measurement`) followed by one column per
+sample. This single function tidies any of them into long format and flags
+censored values.
+
+```{r results-reader}
+read_results_sheet <- function(path, sheet) {
+  raw <- read_excel(path, sheet = sheet, col_names = FALSE, .name_repair = "minimal")
+
+  hdr_row <- which(apply(raw, 1, function(r)
+    any(str_detect(tolower(trimws(as.character(r))), "^metabolite name$"))))[1]
+  stopifnot(!is.na(hdr_row))
+
+  header <- as.character(unlist(raw[hdr_row, ]))
+  header[is.na(header)] <- paste0("V", seq_along(header))[is.na(header)]
+
+  dat <- raw[(hdr_row + 1):nrow(raw), ]
+  colnames(dat) <- header
+  dat <- dat %>% filter(!is.na(`Metabolite name`))
+
+  id_cols     <- intersect(c("Metabolite name", "InChI Key", "Units of Measurement"),
+                            colnames(dat))
+  sample_cols <- setdiff(colnames(dat), id_cols)
+
+  # coerce all sample columns to character first: some columns are pure
+  # numeric and some are numeric+"BLOQ" text, which otherwise clash when
+  # pivoted together
+  dat <- dat %>% mutate(across(all_of(sample_cols), as.character))
+
+  dat %>%
+    pivot_longer(all_of(sample_cols), names_to = "Sample_ID", values_to = "value_raw") %>%
+    mutate(
+      Sample_ID = clean_id(Sample_ID),
+      value_num = suppressWarnings(as.numeric(value_raw)),
+      Flag = case_when(
+        value_raw %in% c("BLOQ")                          ~ "BLOQ",
+        str_detect(coalesce(value_raw, ""), "N\\.D")        ~ "ND",
+        str_detect(coalesce(value_raw, ""), "N/A")          ~ "N/A",
+        is.na(value_num) & !is.na(value_raw)                ~ "other",
+        TRUE                                                 ~ "OK"
+      ),
+      Units = if ("Units of Measurement" %in% colnames(dat)) `Units of Measurement` else NA_character_
+    ) %>%
+    rename(Metabolite = `Metabolite name`) %>%
+    select(Metabolite, Sample_ID, Units, value_num, Flag)
+}
+```
+
+# 5. Import every metabolite panel and join metadata
+
+```{r import-all}
+sheet_map <- tribble(
+  ~sheet,                ~Class,                   ~Matrix,
+  "Results AA- Cells",   "Amino acids",            "Cells",
+  "Results AA- Media",   "Amino acids",            "Media",
+  "Results AC- Cells",   "Acylcarnitines",         "Cells",
+  "Results OA- Cells",   "Organic acids",          "Cells",
+  "Results OA- Media",   "Organic acids",          "Media",
+  "Results NAD",         "NAD metabolites",        "Cells",
+  "Results ATP",         "Energy (ATP/ADP/AMP)",   "Cells",
+  "Results CoA",         "Acyl-CoA",               "Cells"
+)
+
+results_long <- pmap_dfr(sheet_map, function(sheet, Class, Matrix) {
+  read_results_sheet(results_path, sheet) %>% mutate(Class = Class, Matrix = Matrix)
+})
+
+results_annot <- results_long %>% left_join(sample_meta, by = "Sample_ID")
+
+cat("Total metabolite x sample measurements:", nrow(results_annot), "\n")
+cat("Rows that failed to match a sample:", sum(is.na(results_annot$Strain)), "\n")
+```
+
+## 5.1 Data coverage by strain and compartment
+
+This is the direct answer to "why do some plots only show two strains":
+count how many samples of each strain actually exist in each panel /
+compartment. A `0` means that combination genuinely was not run — not that
+the code dropped it.
+
+```{r coverage-table}
+coverage <- results_annot %>%
+  distinct(Class, Matrix, Strain, Sample_ID) %>%
+  count(Class, Matrix, Strain, name = "n_samples") %>%
+  tidyr::pivot_wider(names_from = Strain, values_from = n_samples, values_fill = 0) %>%
+  arrange(Class, Matrix)
+
+knitr::kable(coverage, caption = "Number of samples per Class x Matrix x Strain")
+```
+
+**Reading this table:** the atlA mutant (`atlA mutant` column) is non-zero
+*only* for Acylcarnitines/Cells — every other panel is UA159 + lrgAB only,
+which is a property of the original study, not a filtering choice made
+here. Likewise `Media` (supernatant) rows exist only for Amino acids and
+Organic acids — the other panels (acylcarnitines, NAD metabolites,
+adenylates, acyl-CoAs) were only ever measured intracellularly, so there is
+no supernatant version of those plots to make.
+
+## 5.2 Data-quality summary
+
+```{r qc-summary, fig.height=4}
+qc <- results_annot %>%
+  count(Class, Matrix, Flag) %>%
+  group_by(Class, Matrix) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+ggplot(qc, aes(x = Class, y = pct, fill = Flag)) +
+  geom_col() +
+  facet_wrap(~Matrix, scales = "free_x") +
+  coord_flip() +
+  scale_fill_manual(values = c(OK = "#2c7fb8", BLOQ = "#f2b134", ND = "#d95f02",
+                                "N/A" = "grey60", other = "black")) +
+  labs(title = "Share of censored vs. quantified values per metabolite panel",
+       x = NULL, y = "% of measurements")
+```
+
+Many acylcarnitine species are below the limit of quantitation across the
+board — the plots below automatically keep only the species that were
+actually detected somewhere, per compartment.
+
+# 6. Amino acids: intracellular pool and secretion
+
+Amino acids were profiled in both compartments (UA159 and lrgAB only — see
+5.1), so every comparison here is done twice: once for the intracellular
+pool (`Cells`, nmol/mg protein) and once for what ends up in the supernatant
+(`Media`, uM). The two are kept as separate panels throughout because their
+units and sample sets differ; they are never summed or averaged together.
+
+```{r total-aa-pool, fig.height=4.5, fig.width=9}
+total_aa <- results_annot %>%
+  filter(Class == "Amino acids", !is.na(value_num)) %>%
+  group_by(Sample_ID, Matrix, Strain, Growth_Condition, Replicate) %>%
+  summarise(total = sum(value_num), .groups = "drop") %>%
+  mutate(Matrix = factor(Matrix, levels = c("Cells", "Media")))
+
+ggplot(total_aa, aes(Growth_Condition, total, fill = Strain)) +
+  geom_boxplot(position = position_dodge(0.8), alpha = 0.75, outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.8),
+             size = 2) +
+  facet_wrap(~Matrix, scales = "free_y",
+             labeller = labeller(Matrix = c(Cells = "Intracellular pool (nmol/mg protein)",
+                                             Media = "Secreted into media (uM)"))) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Total amino acid pool: intracellular vs. secreted",
+       y = NULL, x = NULL)
+```
+
+## 6.1 Individual amino acids, intracellular pool
+
+```{r aa-panel, fig.width=11, fig.height=10}
+aa_cells <- results_annot %>%
+  filter(Class == "Amino acids", Matrix == "Cells") %>%
+  group_by(Metabolite) %>%
+  filter(any(Flag == "OK")) %>%
+  ungroup()
+
+ggplot(aa_cells, aes(Growth_Condition, value_num, fill = Strain)) +
+  geom_boxplot(position = position_dodge(0.8), alpha = 0.75, outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.8),
+             size = 0.9) +
+  facet_wrap(~Metabolite, scales = "free_y", ncol = 4) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Intracellular amino acids by strain and growth condition",
+       y = "nmol / mg protein", x = NULL) +
+  theme(legend.position = "top", strip.text = element_text(size = 8))
+```
+
+## 6.2 Individual amino acids, secreted into media
+
+```{r aa-panel-media, fig.width=11, fig.height=10}
+aa_media <- results_annot %>%
+  filter(Class == "Amino acids", Matrix == "Media") %>%
+  group_by(Metabolite) %>%
+  filter(any(Flag == "OK")) %>%
+  ungroup()
+
+ggplot(aa_media, aes(Growth_Condition, value_num, fill = Strain)) +
+  geom_boxplot(position = position_dodge(0.8), alpha = 0.75, outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.8),
+             size = 0.9) +
+  facet_wrap(~Metabolite, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = c("UA159 wild type" = "#66C2A5", "lrgAB mutant" = "#FC8D62",
+                                "Media blank" = "#8DA0CB")) +
+  labs(title = "Amino acids secreted into culture media by strain and growth condition",
+       subtitle = "The 'n/a' column is the uninoculated media blank (baseline)",
+       y = "uM", x = NULL) +
+  theme(legend.position = "top", strip.text = element_text(size = 8))
+```
+
+## 6.3 Intracellular pool vs. secretion, side by side
+
+The most direct way to see whether a strain/condition difference in the
+cell pellet shows up as a difference in what's exported: each row below is
+one amino acid, with its intracellular panel on the left and its secreted
+panel on the right — each on its own y-axis, since the units aren't
+comparable. `drop = FALSE` keeps every metabolite's row aligned to two
+columns even where one side had no quantifiable data, so a metabolite two
+rows apart in Section 6.1 stays lined up with its own media panel here.
+
+```{r aa-compartment-compare, fig.width=9, fig.height=13}
+aa_key <- c("Alanine", "Glutamine", "Glutamic Acid", "Serine", "Glycine", "Aspartic Acid")
+
+aa_compare <- results_annot %>%
+  filter(Class == "Amino acids", Metabolite %in% aa_key,
+         Strain %in% c("UA159 wild type", "lrgAB mutant")) %>%
+  mutate(Matrix = factor(Matrix, levels = c("Cells", "Media")),
+         Metabolite = factor(Metabolite, levels = aa_key))
+
+ggplot(aa_compare, aes(Growth_Condition, value_num, fill = Strain)) +
+  geom_boxplot(position = position_dodge(0.8), outlier.shape = NA, alpha = 0.75) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.8), size = 1) +
+  facet_wrap(~ Metabolite + Matrix, scales = "free_y", ncol = 2, drop = FALSE,
+             labeller = labeller(Matrix = c(Cells = "Intracellular (nmol/mg protein)",
+                                             Media = "Secreted (uM)"),
+                                  .multi_line = FALSE)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Amino acids: intracellular pool (left) vs. secretion into media (right)",
+       subtitle = paste("Shown for a representative subset -",
+                         "swap `aa_key` above for any of the metabolites in 6.1/6.2"),
+       x = NULL, y = NULL)
+```
+
+# 7. Acylcarnitines (the only panel that includes the atlA mutant)
+
+```{r acylcarnitines, fig.width=9, fig.height=6}
+ac_detected <- results_annot %>%
+  filter(Class == "Acylcarnitines", Matrix == "Cells") %>%
+  group_by(Metabolite) %>%
+  filter(any(Flag == "OK")) %>%
+  ungroup()
+
+ggplot(ac_detected, aes(Growth_Condition, value_num, fill = Strain)) +
+  geom_boxplot(position = position_dodge(0.8), alpha = 0.75, outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.8),
+             size = 1.3) +
+  facet_wrap(~Metabolite, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Acylcarnitine species detected above LOQ (Cells, all 3 strains)",
+       y = "nmol / mg protein", x = NULL)
+```
+
+# 8. Organic acids (central carbon / TCA-cycle intermediates)
+
+Like amino acids, organic acids were measured both intracellularly and in
+the supernatant (UA159 and lrgAB only), and the same metabolite names
+recur in both sheets. Here the media panel also includes the **media-blank
+control** (`Media blank`, plotted at the `n/a` growth-condition position) —
+the baseline level in uninoculated BHI, useful for telling net secretion
+apart from what was already in the broth (e.g. citrate, malate, succinate
+are all *higher* in the blank than in inoculated media, i.e. partially
+consumed by the bacteria rather than secreted).
+
+```{r organic-acids, fig.width=10, fig.height=6}
+oa_cells <- results_annot %>%
+  filter(Class == "Organic acids", Matrix == "Cells") %>%
+  group_by(Metabolite) %>%
+  filter(any(Flag == "OK")) %>%
+  ungroup()
+
+ggplot(oa_cells, aes(Growth_Condition, value_num, fill = Strain)) +
+  geom_boxplot(position = position_dodge(0.8), alpha = 0.75, outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.8),
+             size = 1.3) +
+  facet_wrap(~Metabolite, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Intracellular organic acids by strain and growth condition",
+       y = "nmol / mg protein", x = NULL)
+```
+
+## 8.1 Intracellular pool vs. secretion, side by side
+
+```{r oa-compartment-compare, fig.width=9, fig.height=17}
+oa_compare <- results_annot %>%
+  filter(Class == "Organic acids") %>%
+  group_by(Metabolite) %>%
+  filter(any(Flag == "OK")) %>%   # keep the metabolite if detected in EITHER compartment
+  ungroup() %>%
+  mutate(Matrix = factor(Matrix, levels = c("Cells", "Media")),
+         Metabolite = factor(Metabolite))
+
+ggplot(oa_compare, aes(Growth_Condition, value_num, fill = Strain)) +
+  geom_boxplot(position = position_dodge(0.8), outlier.shape = NA, alpha = 0.75) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.8), size = 1) +
+  facet_wrap(~ Metabolite + Matrix, scales = "free_y", ncol = 2, drop = FALSE,
+             labeller = labeller(Matrix = c(Cells = "Intracellular (nmol/mg protein)",
+                                             Media = "Secreted (uM)"),
+                                  .multi_line = FALSE)) +
+  scale_fill_manual(values = c("UA159 wild type" = "#66C2A5", "lrgAB mutant" = "#FC8D62",
+                                "Media blank" = "#8DA0CB")) +
+  labs(title = "Organic acids: intracellular pool (left) vs. secretion into media (right)",
+       subtitle = "'n/a' on the x-axis = uninoculated media blank (Media panels only)",
+       x = NULL, y = NULL) +
+  theme(legend.position = "top")
+```
+
+A blank intracellular panel (e.g. Malate, 3-HBA) means that organic acid
+was below the limit of quantitation in whole cells for both strains, even
+though it was clearly detectable in the supernatant — it isn't missing
+data, the cell pool for those species is just too small/fast-turned-over
+to quantify with this assay.
+
+# 9. Adenylate energy charge (ATP, ADP, AMP)
+
+Energy charge is calculated as
+$\text{EC} = \dfrac{[\text{ATP}] + 0.5\,[\text{ADP}]}{[\text{ATP}]+[\text{ADP}]+[\text{AMP}]}$.
+
+```{r energy-charge, fig.height=4.5}
+adenylates <- results_annot %>%
+  filter(Class == "Energy (ATP/ADP/AMP)") %>%
+  select(Sample_ID, Metabolite, value_num, Strain, Growth_Condition, Replicate) %>%
+  pivot_wider(names_from = Metabolite, values_from = value_num) %>%
+  mutate(Energy_Charge = (ATP + 0.5 * ADP) / (ATP + ADP + AMP))
+
+ggplot(adenylates, aes(Growth_Condition, Energy_Charge, fill = Strain)) +
+  geom_boxplot(position = position_dodge(0.8), alpha = 0.75, outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.8),
+             size = 2) +
+  scale_fill_brewer(palette = "Set2") +
+  ylim(0, 1) +
+  labs(title = "Adenylate energy charge", y = "Energy charge", x = NULL)
+```
+
+# 10. NAD(H)/NADP(H) pool and acyl-CoAs
+
+```{r nad-coa, fig.width=10, fig.height=6}
+nad_coa <- results_annot %>%
+  filter(Class %in% c("NAD metabolites", "Acyl-CoA")) %>%
+  group_by(Metabolite) %>%
+  filter(any(Flag == "OK")) %>%
+  ungroup()
+
+ggplot(nad_coa, aes(Growth_Condition, value_num, fill = Strain)) +
+  geom_boxplot(position = position_dodge(0.8), alpha = 0.75, outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.8),
+             size = 1.3) +
+  facet_wrap(~Metabolite, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "NAD-related metabolites and acyl-CoAs (species detected above LOQ)",
+       y = "nmol / mg protein", x = NULL)
+```
+
+# 11. Multivariate view: intracellular metabolome PCA
+
+This PCA deliberately combines only same-compartment data: all Cells-matrix
+panels (amino acids, acylcarnitines, organic acids, NAD metabolites,
+adenylates, acyl-CoAs), restricted to UA159 and lrgAB — the two strains with
+a complete panel set (Section 5.1) — so every sample has the same features
+on the same `nmol/mg protein` scale. `BLOQ`/non-detected values are imputed
+at half the minimum observed value for that metabolite (a standard,
+conservative approach for left-censored metabolomics data), and any
+metabolite never detected in this strain pair is dropped. The parallel
+secretome PCA in 11.2 is kept as a *separate* ordination rather than
+merged in, because Media is a different matrix on a different unit scale
+(uM) with a partly different sample set (it also includes the media-blank
+controls) — pooling the two compartments into one PCA would let the unit
+scale dominate the ordination rather than the biology.
+
+```{r pca, fig.height=5.5}
+cells_full_panel <- results_annot %>%
+  filter(Matrix == "Cells", Strain %in% c("UA159 wild type", "lrgAB mutant"))
+
+cells_imputed <- cells_full_panel %>%
+  group_by(Class, Metabolite) %>%
+  mutate(
+    half_min  = suppressWarnings(min(value_num, na.rm = TRUE)) / 2,
+    half_min  = ifelse(is.finite(half_min), half_min, NA_real_),
+    value_imp = ifelse(is.na(value_num), half_min, value_num)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(value_imp))
+
+wide <- cells_imputed %>%
+  mutate(feat = paste(Class, Metabolite, sep = " | ")) %>%
+  distinct(Sample_ID, feat, .keep_all = TRUE) %>%
+  select(Sample_ID, feat, value_imp, Strain, Growth_Condition, Replicate) %>%
+  pivot_wider(names_from = feat, values_from = value_imp)
+
+meta_cols <- c("Sample_ID", "Strain", "Growth_Condition", "Replicate")
+mat <- wide %>% select(-all_of(meta_cols)) %>% as.matrix()
+rownames(mat) <- wide$Sample_ID
+mat <- mat[, colSums(is.na(mat)) == 0, drop = FALSE]   # keep fully-observed features
+
+pca <- prcomp(mat, center = TRUE, scale. = TRUE)
+varexp <- summary(pca)$importance[2, 1:2] * 100
+
+scores <- as_tibble(pca$x[, 1:2], rownames = "Sample_ID") %>%
+  left_join(wide %>% select(Sample_ID, Strain, Growth_Condition), by = "Sample_ID")
+
+ggplot(scores, aes(PC1, PC2, color = Strain, shape = Growth_Condition)) +
+  geom_point(size = 3.5) +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = paste0("PC1 (", round(varexp[1], 1), "%)"),
+       y = paste0("PC2 (", round(varexp[2], 1), "%)"),
+       title = paste0("PCA of intracellular metabolome (n = ", nrow(mat),
+                       " samples, ", ncol(mat), " metabolites)"))
+```
+
+## 11.1 Heatmap of z-scored metabolite abundance
+
+```{r heatmap, fig.width=10, fig.height=11}
+z <- scale(mat)
+
+hc_feat <- hclust(dist(t(z)))
+hc_samp <- hclust(dist(z))
+
+z_long <- as_tibble(z, rownames = "Sample_ID") %>%
+  pivot_longer(-Sample_ID, names_to = "feat", values_to = "z") %>%
+  mutate(Sample_ID = factor(Sample_ID, levels = rownames(z)[hc_samp$order]),
+         feat      = factor(feat,      levels = colnames(z)[hc_feat$order]))
+
+ggplot(z_long, aes(Sample_ID, feat, fill = z)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                        midpoint = 0, name = "z-score") +
+  labs(title = "Hierarchically clustered, z-scored intracellular metabolite levels",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.text.y = element_text(size = 6),
+        panel.grid = element_blank())
+```
+
+## 11.2 Secretome (media) PCA
+
+The extracellular counterpart to Section 11: amino acid + organic acid
+panels measured in the supernatant, for UA159, lrgAB, and the media-blank
+control — imputed and scaled the same way, but never combined with the
+Cells-matrix data above.
+
+```{r media-pca, fig.height=5.5}
+media_imputed <- results_annot %>%
+  filter(Matrix == "Media") %>%
+  group_by(Class, Metabolite) %>%
+  mutate(
+    half_min  = suppressWarnings(min(value_num, na.rm = TRUE)) / 2,
+    half_min  = ifelse(is.finite(half_min), half_min, NA_real_),
+    value_imp = ifelse(is.na(value_num), half_min, value_num)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(value_imp))
+
+wide_media <- media_imputed %>%
+  mutate(feat = paste(Class, Metabolite, sep = " | ")) %>%
+  distinct(Sample_ID, feat, .keep_all = TRUE) %>%
+  select(Sample_ID, feat, value_imp, Strain, Growth_Condition) %>%
+  pivot_wider(names_from = feat, values_from = value_imp)
+
+mat_media <- wide_media %>% select(-Sample_ID, -Strain, -Growth_Condition) %>% as.matrix()
+rownames(mat_media) <- wide_media$Sample_ID
+mat_media <- mat_media[, colSums(is.na(mat_media)) == 0, drop = FALSE]
+
+pca_media <- prcomp(mat_media, center = TRUE, scale. = TRUE)
+varexp_media <- summary(pca_media)$importance[2, 1:2] * 100
+
+scores_media <- as_tibble(pca_media$x[, 1:2], rownames = "Sample_ID") %>%
+  left_join(wide_media %>% select(Sample_ID, Strain, Growth_Condition), by = "Sample_ID")
+
+ggplot(scores_media, aes(PC1, PC2, color = Strain, shape = Growth_Condition)) +
+  geom_point(size = 3.5) +
+  scale_color_manual(values = c("UA159 wild type" = "#E41A1C", "lrgAB mutant" = "#377EB8",
+                                 "Media blank" = "#4DAF4A")) +
+  labs(x = paste0("PC1 (", round(varexp_media[1], 1), "%)"),
+       y = paste0("PC2 (", round(varexp_media[2], 1), "%)"),
+       title = paste0("Secretome PCA (n = ", nrow(mat_media),
+                       " samples, ", ncol(mat_media), " metabolites)"),
+       subtitle = "Includes the media-blank control as a reference point")
+```
+
+The media-blank samples typically separate clearly from inoculated media on
+PC1 — that's the net effect of bacterial consumption/secretion on the
+supernatant composition, and is a useful sanity check that the assay is
+picking up real biology.
+
+# 12. Session info
+
+```{r session-info}
+sessionInfo()
+```
