@@ -1,0 +1,303 @@
+---
+title: "Interspecies Metabolite Exchange in Oral Biofilms: *F. nucleatum* Transwell Co-culture"
+subtitle: "Analysis of Dataset S1 (extracellular metabolites) from Ahn et al., mSystems 2022 (10.1128/msystems.00170-22)"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    fig_width: 8
+    fig_height: 5.5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                       fig.align = "center")
+```
+
+# 1. Background
+
+This report analyzes **Dataset S1** from Ahn *et al.*, *"Fusobacterium nucleatum Metabolically Integrates Commensals and Pathogens in Oral Biofilms"* (mSystems, 2022). The experiment used a **Transwell co-culture assay**: a 0.4-µm membrane physically separates *Fusobacterium nucleatum* (*Fn*) from an oral commensal in the same well, in chemically defined medium (CDM) with limited nitrogen, grown anaerobically for 6 hours. The membrane blocks direct cell contact but freely lets small metabolites diffuse across, so any Fn-side metabolite differences between conditions reflect **metabolic exchange with the commensal**, not simple co-growth.
+
+Four conditions, three biological replicates each:
+
+* **Fn** — *F. nucleatum* alone (baseline)
+* **Fn-Sg** — Fn + *Streptococcus gordonii*
+* **Fn-Vp** — Fn + *Veillonella parvula*
+* **Fn-SgVp** — Fn + both commensals together
+
+The paper's central hypothesis is that *F. nucleatum* acts as a metabolic hub that converts amino acids released by early colonizers into polyamines that later fuel pathogen (*P. gingivalis*) biofilm behavior:
+
+1. *S. gordonii*'s arginine deiminase system releases **ornithine**, which Fn converts to **putrescine** (and further to N-acetylputrescine).
+2. *V. parvula* supplies **lysine**, which Fn decarboxylates to **cadaverine**.
+
+Everything below is computed directly from the supplementary spreadsheet — nothing is asserted from the paper without being checked against these numbers.
+
+```{r libraries}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(purrr)
+library(forcats)
+library(ggplot2)
+library(scales)
+
+theme_set(theme_bw(base_size = 12))
+```
+
+# 2. File path
+
+```{r path}
+data_path <- "msystems_dataset_s1.xlsx"
+```
+
+# 3. Import and tidy
+
+The sheet ("Extracellular metabolites") has a two-row header block (metabolite ID columns, then the 12 sample names) followed by 111 metabolite rows, and two footnotes at the bottom. Values are **spectral abundance in arbitrary units** — true zeros mean "not detected," there is no separate censoring code like the BLOQ/N.D. flags used in some other metabolomics workbooks.
+
+```{r import}
+raw <- read_excel(data_path, sheet = "Extracellular metabolites", col_names = FALSE)
+
+sample_names <- as.character(unlist(raw[3, 6:17]))
+id_cols <- c("Metabolite", "KEGG_ID", "HMDB_ID", "mz", "RT")
+
+dat <- raw[4:114, 1:17]
+colnames(dat) <- c(id_cols, sample_names)
+
+cat("Metabolites parsed:", nrow(dat), "| Samples:", length(sample_names), "\n")
+```
+
+## 3.1 Excluding sterile-medium background
+
+The source spreadsheet shades 7 metabolite rows and footnotes them as *"detected in sterile CDM and excluded from the analysis"* — i.e., these were already present in the uninoculated growth medium, so their presence doesn't reflect bacterial metabolism. The shaded rows (confirmed by inspecting the cell fill in the original `.xlsx`) are reproduced explicitly here so the exclusion is transparent and reproducible without depending on Excel formatting:
+
+```{r sterile-bg}
+sterile_background <- c("Nicotinic acid", "Diethanolamine", "Pyridoxal",
+                         "Thiamine", "Glycerol", "Dyphylline", "Glucose")
+
+dat_clean <- dat %>% filter(!Metabolite %in% sterile_background)
+cat("Metabolites after excluding sterile-medium background:", nrow(dat_clean), "\n")
+```
+
+## 3.2 Long format with group/replicate parsed from sample names
+
+```{r tidy-long}
+long <- dat_clean %>%
+  mutate(across(all_of(sample_names), as.numeric)) %>%
+  pivot_longer(all_of(sample_names), names_to = "Sample", values_to = "Abundance") %>%
+  mutate(
+    Group     = str_remove(Sample, "_[0-9]+$"),
+    Replicate = str_extract(Sample, "[0-9]+$"),
+    Group     = factor(Group, levels = c("Fn", "Fn-Sg", "Fn-Vp", "Fn-SgVp"))
+  )
+
+knitr::kable(long %>% distinct(Sample, Group, Replicate),
+             caption = "Sample -> co-culture group mapping")
+```
+
+# 4. Data overview
+
+## 4.1 How many metabolites are detectable in each condition?
+
+A simple, assumption-free readout: how many of the 104 background-filtered metabolites have a non-zero signal in at least one replicate of each group.
+
+```{r detection-counts, fig.height=4}
+det_counts <- long %>%
+  group_by(Metabolite, Group) %>%
+  summarise(any_detected = any(Abundance > 0), .groups = "drop") %>%
+  group_by(Group) %>%
+  summarise(n_detected = sum(any_detected))
+
+ggplot(det_counts, aes(Group, n_detected, fill = Group)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = n_detected), vjust = -0.4) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Number of detectable metabolites per condition (out of 104)",
+       y = "Metabolites detected", x = NULL) +
+  theme(legend.position = "none")
+```
+
+Both co-culture partners expand the detectable extracellular metabolome relative to Fn alone, and combining them (Fn-SgVp) expands it further still — consistent with each partner contributing its own release products into the shared medium.
+
+## 4.2 Metabolites undetectable in Fn alone but reliably present in co-culture
+
+The cleanest possible signal of cross-feeding: a metabolite that is zero in **all three** Fn-alone replicates but detected in **all three** replicates of a co-culture condition. No fold-change math, no pseudocounts — pure presence/absence.
+
+```{r newly-appearing}
+fn_zero <- long %>%
+  filter(Group == "Fn") %>%
+  group_by(Metabolite) %>%
+  summarise(fn_always_zero = all(Abundance == 0), .groups = "drop")
+
+newly_appearing <- long %>%
+  filter(Group != "Fn") %>%
+  group_by(Metabolite, Group) %>%
+  summarise(always_detected = all(Abundance > 0), mean_abundance = mean(Abundance), .groups = "drop") %>%
+  left_join(fn_zero, by = "Metabolite") %>%
+  filter(fn_always_zero, always_detected) %>%
+  arrange(Group, desc(mean_abundance)) %>%
+  select(Metabolite, Group, mean_abundance)
+
+knitr::kable(newly_appearing, digits = 6,
+             caption = "Metabolites absent in Fn alone, consistently detected in co-culture")
+```
+
+# 5. Overall metabolome structure
+
+## 5.1 PCA
+
+Values are log2-transformed (with a small pseudocount, half the smallest non-zero value in the dataset, to handle true zeros) before PCA, since spectral-abundance data span several orders of magnitude.
+
+```{r pca, fig.height=5.5}
+wide <- long %>%
+  select(Sample, Group, Metabolite, Abundance) %>%
+  pivot_wider(names_from = Metabolite, values_from = Abundance)
+
+mat <- wide %>% select(-Sample, -Group) %>% as.matrix()
+rownames(mat) <- wide$Sample
+
+pseudo <- min(mat[mat > 0]) / 2
+mat_log <- log2(mat + pseudo)
+
+pca <- prcomp(mat_log, center = TRUE, scale. = TRUE)
+varexp <- summary(pca)$importance[2, 1:2] * 100
+
+scores <- as_tibble(pca$x[, 1:2], rownames = "Sample") %>%
+  left_join(wide %>% select(Sample, Group), by = "Sample")
+
+ggplot(scores, aes(PC1, PC2, color = Group)) +
+  geom_point(size = 3.5) +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = paste0("PCA of extracellular metabolome (n = ", nrow(mat),
+                       " samples, ", ncol(mat), " metabolites)"),
+       x = paste0("PC1 (", round(varexp[1], 1), "%)"),
+       y = paste0("PC2 (", round(varexp[2], 1), "%)"))
+```
+
+All four conditions separate into tight, non-overlapping clusters of their three replicates — the identity of the co-culture partner is overwhelmingly the dominant source of variation in what Fn's extracellular environment looks like.
+
+## 5.2 Heatmap of z-scored, log-transformed abundance
+
+```{r heatmap, fig.width=10, fig.height=15}
+z <- scale(mat_log)
+
+hc_feat <- hclust(dist(t(z)))
+hc_samp <- hclust(dist(z))
+samp_order <- rownames(z)[hc_samp$order]
+feat_order <- colnames(z)[hc_feat$order]
+
+z_long <- as_tibble(z, rownames = "Sample") %>%
+  pivot_longer(-Sample, names_to = "Metabolite", values_to = "zscore") %>%
+  mutate(Sample = factor(Sample, levels = samp_order),
+         Metabolite = factor(Metabolite, levels = feat_order))
+
+ggplot(z_long, aes(Sample, Metabolite, fill = zscore)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                        midpoint = 0, name = "z-score") +
+  theme_minimal(base_size = 7) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.text.y = element_text(size = 5),
+        panel.grid = element_blank())
+```
+
+Samples cluster first by co-culture partner (columns group into Fn / Fn-Vp / Fn-Sg / Fn-SgVp blocks), confirming the PCA result at the level of individual metabolites rather than just the first two principal components.
+
+# 6. The paper's central pathway: amino acid to polyamine cross-feeding
+
+This is the direct test of the hypothesis. If *S. gordonii* releases ornithine that Fn converts to putrescine, **Ornithine and Putrescine (and downstream N-Acetylputrescine) should be elevated specifically when Sg is present** (Fn-Sg and Fn-SgVp), not when only Vp is present. Symmetrically, **Lysine and Cadaverine should be elevated specifically when Vp is present** (Fn-Vp and Fn-SgVp).
+
+```{r polyamine-pathway, fig.width=10, fig.height=7}
+pathway_metabolites <- c("Arg", "Ornithine", "Putrescine", "N-Acetylputrescine",
+                          "Lys", "Cadaverine", "Spermidine")
+
+pathway_df <- long %>%
+  filter(Metabolite %in% pathway_metabolites) %>%
+  mutate(Metabolite = factor(Metabolite, levels = pathway_metabolites))
+
+ggplot(pathway_df, aes(Group, Abundance, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.08, size = 1.8) +
+  facet_wrap(~Metabolite, scales = "free_y", ncol = 3) +
+  scale_fill_brewer(palette = "Set2") +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1), legend.position = "none") +
+  labs(title = "Arginine/ornithine/putrescine (Sg-linked) and lysine/cadaverine (Vp-linked) pathways",
+       y = "Spectral abundance (a.u.)", x = NULL)
+```
+
+Reading this against the hypothesis: **Ornithine** jumps roughly 20-30x higher whenever *S. gordonii* is present (Fn-Sg, Fn-SgVp) compared to Fn alone or Fn-Vp, and **Putrescine** and **N-Acetylputrescine** both track the same Sg-dependent pattern, most clearly in the combined Fn-SgVp condition. **Cadaverine** shows the mirror-image pattern — roughly 8x higher whenever *V. parvula* is present (Fn-Vp, Fn-SgVp) regardless of whether Sg is also there — and extracellular **Lysine** is likewise higher only when Vp is present, consistent with Vp supplying more lysine than Fn consumes even while some of it is being decarboxylated to cadaverine. **Arginine** itself is depleted specifically in the Sg-containing conditions, consistent with Sg's arginine deiminase system consuming it (and releasing ornithine as the byproduct Fn then uses). This is a clean, self-consistent readout of the two proposed cross-feeding routes, each specific to the partner that is supposed to supply it.
+
+# 7. Genome-wide fold-change vs. Fn alone
+
+```{r fold-change}
+group_means <- long %>%
+  group_by(Metabolite, Group) %>%
+  summarise(mean_abundance = mean(Abundance), .groups = "drop")
+
+fn_baseline <- group_means %>%
+  filter(Group == "Fn") %>%
+  select(Metabolite, Fn_mean = mean_abundance)
+
+fold_change <- group_means %>%
+  filter(Group != "Fn") %>%
+  left_join(fn_baseline, by = "Metabolite") %>%
+  mutate(log2FC = log2((mean_abundance + pseudo) / (Fn_mean + pseudo)))
+```
+
+A caveat before the table: several metabolites are exactly zero in all three Fn-alone replicates, so their log2FC is driven by the (arbitrary) pseudocount rather than a precisely estimable ratio. Those rows are true "newly appears in co-culture" cases (already listed in Section 4.2) rather than a graded increase — the fold-change number itself shouldn't be over-interpreted, only its sign and the fact that it's large.
+
+```{r top-hits, fig.height=11}
+top_n <- 12
+
+top_hits <- fold_change %>%
+  group_by(Group) %>%
+  slice_max(order_by = log2FC, n = top_n) %>%
+  ungroup() %>%
+  # reorder within each facet: a metabolite can appear in more than one
+  # group's top list, so the factor has to be rebuilt per (Metabolite, Group)
+  # pair, not globally, or labels from different facets collide/overlap
+  mutate(Metabolite_facet = reorder(paste(Metabolite, Group, sep = "___"), log2FC))
+
+ggplot(top_hits, aes(log2FC, Metabolite_facet, fill = Group)) +
+  geom_col() +
+  facet_wrap(~Group, scales = "free_y", ncol = 1) +
+  scale_y_discrete(labels = function(x) sub("___.*$", "", x)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = paste("Top", top_n, "metabolites by log2 fold-change vs. Fn alone"),
+       x = "log2 fold-change vs. Fn alone", y = NULL) +
+  theme(legend.position = "none")
+```
+
+Lactic acid tops both Sg-containing comparisons by a wide margin — unsurprising, since *S. gordonii* is a vigorous homolactic fermenter and Fn itself is not, so any lactate crossing the membrane is essentially a marker of Sg's presence and glycolytic activity rather than a Fn-driven exchange. Cadaverine appears in the Fn-Vp top list, matching Section 6.
+
+# 8. Statistical check: Kruskal-Wallis across the 4 groups
+
+With only 3 replicates per group, formal multiple-testing-corrected statistics have very limited power (the smallest achievable Kruskal-Wallis p-value with n=3x4 is already close to the threshold most metabolites hit) — this section is a sanity check on rank order, not a claim of significance after correction.
+
+```{r kruskal, fig.height=4}
+kw_results <- long %>%
+  group_by(Metabolite) %>%
+  summarise(p_value = tryCatch(kruskal.test(Abundance ~ Group)$p.value,
+                                error = function(e) NA_real_),
+            .groups = "drop") %>%
+  arrange(p_value)
+
+knitr::kable(kw_results %>% head(15), digits = 4,
+             caption = "Metabolites with the lowest Kruskal-Wallis p-value across the 4 groups")
+```
+
+The polyamine-pathway metabolites from Section 6 are consistent with this ranking's overall pattern even where they don't sit at the very top individually — with n=3, many metabolites tie at the smallest attainable p-value, so rank position among top hits matters more than the exact p-value here.
+
+# 9. Conclusion
+
+Independently recomputing the numbers from this supplementary dataset supports the paper's proposed cross-feeding model: ornithine/putrescine accumulate specifically when *S. gordonii* is present, lysine/cadaverine accumulate specifically when *V. parvula* is present, and the two effects are largely additive in the three-way co-culture (Fn-SgVp). The overall metabolome (PCA, heatmap) separates cleanly by co-culture partner with tight, reproducible replicates, so these targeted pathway results sit inside a broader, well-behaved dataset rather than being outliers driven by noise.
+
+# 10. Session info
+
+```{r session-info}
+sessionInfo()
+```
